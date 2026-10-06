@@ -4,26 +4,39 @@ IBKR-backed gamma exposure (GEX) backend. Pulls an option chain through IB
 Gateway for any symbol on demand, computes the GEX profile, **zero gamma**,
 **call wall** and **put wall**, and serves them over REST and WebSocket.
 
-Python 3.11+, `ib_async`, FastAPI, numpy/scipy, SQLite. Single asyncio process.
+Python 3.11+, [NautilusTrader](https://nautilustrader.io/docs/latest/developer_guide/) IB adapter, FastAPI, numpy/scipy, SQLite. Single asyncio process.
 
 ## How it works
 
 ```
 Frontend --REST/WS--> FastAPI --> Scheduler (watch list, cache, 90 s refresh)
                                      |
-                                 ChainFetcher --ib_async--> IB Gateway (127.0.0.1:4002)
+                                 ChainFetcher
+                                     |
+                    Nautilus HistoricInteractiveBrokersClient
+                    + InteractiveBrokersInstrumentProvider
+                                     |
+                                 IB Gateway (127.0.0.1:4002)
                                      |
                                  compute_gex --> in-memory result + SQLite snapshots
 ```
 
+The service does **not** open its own TWS socket. It uses the NautilusTrader
+IB adapter as documented in the [developer guide](https://nautilustrader.io/docs/latest/developer_guide/)
+and [Interactive Brokers integration](https://nautilustrader.io/docs/latest/integrations/interactive_brokers/):
+`HistoricInteractiveBrokersClient`, `InteractiveBrokersInstrumentProvider`,
+`IBContract(build_options_chain=True)`, `subscribe_market_data`, and
+`request_bars`. During RTH this process is the only IBKR data consumer on the
+Gateway; defaults follow the adapter (`client_id=1`, paper port `4002`) and
+IB's own simultaneous-line ceiling (100), not a reserved band for other apps.
+
 Per symbol fetch (`src/gex_service/chain.py`):
 
-1. Resolve the underlying: `Stock(sym, SMART, USD)`, else `Index` (SPX, NDX, VIX, RUT, XSP, DJX, OEX are pre-mapped).
-2. Read spot (`last`, falling back to `close` / mid).
-3. `reqSecDefOptParams` → expirations and strikes per trading class on SMART. Trading classes are merged, so SPX includes both `SPX` monthlies and `SPXW` weeklies/0DTE.
-4. Keep expiries with `dte <= max_dte` (or the explicit `expiries=` list) and strikes within `spot * (1 ± strike_range_pct)`; cap at `max_contracts` by dropping the strikes furthest from spot symmetrically.
-5. `reqContractDetails` per (expiry, trading class) to get real contracts (cached per trading day, 4 in parallel).
-6. Subscribe in batches of 60 with generic ticks `100,101,106` (volume, open interest, model greeks), wait up to 3 s per batch, cancel, repeat.
+1. Resolve the underlying with Nautilus `request_instruments` (`STK` on SMART, else `IND`; SPX, NDX, VIX, RUT, XSP, DJX, OEX are pre-mapped).
+2. Read spot (`last`, falling back to `close` / mid) via Nautilus market-data subscribe.
+3. Load the chain the adapter way: `IBContract(..., build_options_chain=True, min_expiry_days=0, max_expiry_days=max_dte)` (or `lastTradeDateOrContractMonth` when `expiries=` is set). Trading classes are merged, so SPX includes both `SPX` monthlies and `SPXW` weeklies/0DTE.
+4. Keep strikes within `spot * (1 ± strike_range_pct)`; cap at `max_contracts` by dropping the strikes furthest from spot symmetrically.
+5. Subscribe in batches of 100 (`GEX_MAX_MD_LINES`) with generic ticks `100,101,106` (volume, open interest, model greeks), wait up to 3 s per batch, cancel, repeat. Historical ADV / IV / HV go through Nautilus `request_bars`, spaced by IB pacing (`GEX_HISTORICAL_REQUEST_DELAY_S=1`).
 
 GEX math (`src/gex_service/gex.py`):
 
@@ -46,6 +59,8 @@ of the basic GEX profile:
 | `volume_lens` | `total_gex`, `call_wall`, `put_wall`, `zero_gamma`, volumes | The same GEX machinery weighted by **today's volume** instead of settled OI. Settled OI is a prior-night snapshot; volume shows where positioning is being built today. The flip from this lens typically sits closer to spot. |
 | `implied_move` | `straddle_price`, `straddle_move_pct`, `atm_iv`, `iv_move_to_expiry_pct`, `iv_daily_move_pct` | Expected move from the nearest expiry's ATM straddle and from ATM IV. Lets the frontend draw the expected range against the walls. |
 | `concentration` | `absolute_gamma_strike`, `top_strikes`, `gex_hhi`, `zero_dte_share` | The **absolute gamma strike** (largest total gamma regardless of sign, a classic magnet/pin candidate), the top five strikes, a Herfindahl index of how concentrated gamma is, and the share of gamma sitting in 0DTE contracts. |
+| `roll_off` | `drop_nearest`, `drop_week` | Profile after the nearest expiry (and everything ≤ 7 DTE) drops off. Same numbers as `?exclude_expiries=`. |
+| `iv_context` | `iv30`, `iv30_rank_1y`, `iv30_percentile_1y`, `hv30`, `iv_hv_spread` | IBKR 30-day implied and historical vol (1 year of daily bars). |
 | `gamma_curve[].net_vex`, `profile[].net_dex/net_vex/net_cex/net_gex_volume`, `by_expiry[].vex/cex/abs_gex_share` | | Per-level and per-strike breakdowns of the above for heatmaps. |
 
 Formulas (dealer long calls / short puts, sign `s = +1` calls, `-1` puts):
@@ -76,7 +91,7 @@ products and liquid names, weaker for single stocks around events.
 ### Data caveats
 
 - **Open interest from IBKR is the prior session's settlement value**, updated once a day. The response carries `oi_asof`. Intraday changes in GEX therefore come from spot / IV / gamma, not from OI.
-- Market data lines are shared across every API client on the same IBKR username. To leave room for other clients on the same Gateway, this service only ever holds ≤ `GEX_BATCH_SIZE` (60) lines at once and refreshes watched symbols serially.
+- Market data lines are an IB account limit. This service uses up to `GEX_MAX_MD_LINES` (100) simultaneous `reqMktData` subscriptions, then cancels and takes the next batch. Watched symbols refresh serially so one fetch finishes before the next starts.
 - The account needs OPRA (US options) market data. Outside RTH the service switches to frozen data (`GEX_AUTO_FROZEN`).
 - IB publishes no model greeks for some deep ITM / illiquid contracts and no OI tick for contracts with zero OI; those rows are counted in `meta.dropped_contracts`. Both contribute ~0 GEX anyway.
 
@@ -89,11 +104,27 @@ All `/api/v1/*` routes accept an optional `X-API-Key` header (or `?api_key=`) wh
 | Route | Purpose |
 | --- | --- |
 | `GET /health` | Gateway connection, market data type, lines in use, watched symbols, RSS |
-| `GET /api/v1/gex/{symbol}` | Full GEX payload. Query: `max_dte`, `strike_range_pct`, `max_contracts`, `expiries=YYYYMMDD,...`, `refresh=true`, `wait=false` |
+| `GET /api/v1/gex/{symbol}` | Full GEX payload. Query: `max_dte`, `strike_range_pct`, `max_contracts`, `expiries=YYYYMMDD,...`, `exclude_expiries=YYYYMMDD,...` (OPEX roll-off, from cache), `refresh=true`, `wait=false` |
 | `GET /api/v1/gex/{symbol}/chain` | Per-contract rows (quotes, IV, gamma, OI, per-contract GEX) |
 | `GET /api/v1/gex/{symbol}/history?from=&to=&limit=` | Intraday snapshot summaries from SQLite |
+| `GET /api/v1/gex/{symbol}/scenarios` | Spot × IV × time hedging-pressure grid (`spot_pct`, `spot_steps`, `iv_points`, `iv_steps`, `days=0,1`) |
+| `GET /api/v1/gex/{symbol}/surface` | IV smile / 25Δ RR / butterfly / term structure + 1y IV rank / HV |
+| `GET /api/v1/gex/{symbol}/drift?date=` | Intraday movement of walls, zero gamma, Γ^IB and regime |
+| `GET /api/v1/gex/{symbol}/eod` | Archived end-of-day rows |
+| `GET /api/v1/gex/{symbol}/realized?days=` | 5-minute realized vol, lag-1 autocorr, last-30 vs rest-of-day |
+| `GET /api/v1/gex/{symbol}/validation?days=` | Next-day realized vol / autocorr vs yesterday's Γ^IB (Barbon–Buraschi style) |
+| `GET /api/v1/gex/{symbol}/backtest?days=` | Call/put wall hold rates, OI-wall comparison, zero-gamma side persistence |
+| `GET /api/v1/gex/{symbol}/oi-estimate` | Intraday OI = settlement OI + `opening_ratio` × today's volume, plus next-day reconcile |
+| `GET /api/v1/gex/{symbol}/features?date=` | One flat feature row (live or archived EOD) for a research catalog |
+| `GET /api/v1/features/export` | CSV/JSON of archived EOD features (`symbols=`, `days=`, `format=`) |
+| `GET /api/v1/scan` | Cross-section of watched (or `symbols=`) names, sortable by Γ^IB / 0DTE share / HHI / … |
+| `GET /api/v1/complex` / `GET /api/v1/complex/{SPX\|NDX\|RUT\|VIX}` | Index-complex GEX (members mapped to the anchor by spot ratio) |
+| `PUT/GET/DELETE /api/v1/flow/{symbol}` | Lee-Ready flow GEX on near-ATM nearest-expiry contracts (budgeted MD lines) |
+| `GET /api/v1/alerts` / `PUT /api/v1/alerts/{symbol}/config` | Edge-triggered alerts; optional `GEX_ALERT_WEBHOOK_URL` |
+| `POST /api/v1/eod/archive` | Force today's EOD archive (normally automatic after 16:05 ET) |
 | `GET /api/v1/watch` / `PUT /api/v1/watch/{symbol}` / `DELETE /api/v1/watch/{symbol}` | Pin symbols for continuous refresh (same query params as the GEX route) |
 | `WS /ws/gex/{symbol}` | Sends the cached payload on connect, then every refresh |
+| `WS /ws/alerts` | Streams alert events |
 
 `GET /api/v1/gex/{symbol}` blocks until the first fetch finishes (up to `GEX_FETCH_TIMEOUT_S`, then 504). Pass `wait=false` to get `202 {"status":"pending"}` immediately and poll. Any symbol requested is auto-watched and refreshed every `GEX_REFRESH_INTERVAL_S` until nobody has asked for it for `GEX_IDLE_TTL_S`; pinned symbols (via `PUT /watch`) and symbols with open WebSockets are never evicted.
 
@@ -122,7 +153,22 @@ Response shape (abridged):
 }
 ```
 
-`zero_gamma_method` is one of `bs_grid`, `bs_grid_no_flip` (no crossing within ±10 %, `zero_gamma` is null), `strike_profile`, `none`.
+`zero_gamma_method` is one of `bs_grid`, `bs_grid_no_flip` (no crossing within ±10 %, `zero_gamma` is null), `strike_profile`, `none`. The payload also includes `roll_off` (post-expiry book) and `iv_context` (30-day IV rank).
+
+Offline catalog dump without the service running:
+
+```sh
+uv run gex-export --db data/gex.sqlite --symbols SPY,QQQ --days 250 > features.csv
+```
+
+Feed that CSV into a research pipeline (or a Nautilus/catalog writer) as daily features: Γ^IB, walls, zero-gamma distance, 0DTE share, IV rank, roll-off, etc.
+
+What this backend does **not** do (and why):
+
+- **SpotGamma Volatility Trigger**: proprietary, no public definition. The open analogue is the Black-Scholes `zero_gamma` plus `hedge_flow.distance_to_zero_gamma_pct`.
+- **True dealer inventory**: public OI has no participant type. Flow GEX is Lee-Ready on a handful of near-ATM contracts, not a book reconstruction.
+- **CME futures options (ES/NQ)**: different IBKR `secType` / exchange path; index complexes use the cash/ETF overlay (SPX+SPY+XSP, NDX+QQQ, RUT+IWM, VIX).
+- **LETF rebalance flow**: needs external AUM, not in IBKR.
 
 ## Local development
 
@@ -138,7 +184,7 @@ curl 'http://127.0.0.1:8090/api/v1/gex/SPY?max_dte=10&strike_range_pct=0.04'
 uv run pytest
 ```
 
-Use a `GEX_IB_CLIENT_ID` that no other API client on the same Gateway uses (default 41).
+Use a `GEX_IB_CLIENT_ID` that is unique for this process (Nautilus default is 1).
 
 ## Deploying next to IB Gateway (macOS, launchd)
 
@@ -167,21 +213,35 @@ tunnel in (`ssh -N -L 8090:127.0.0.1:8090 user@gateway-host`) or set
 
 Keep an eye on `rss_mb` in `/health`.
 
+## Copyright
+
+gex-service is Copyright (c) 2026 geese1028 and is released under the MIT License (`LICENSE`).
+
+The IBKR session is the [NautilusTrader](https://nautilustrader.io/) Interactive Brokers adapter (`nautilus_trader`), Copyright (c) 2015–2026 Nautech Systems Pty Ltd, licensed under the [GNU Lesser General Public License v3.0](https://github.com/nautechsystems/nautilus_trader/blob/master/LICENSE). This repository depends on that published package. It does not vendor NautilusTrader source and does not relicense it. See `NOTICE`.
+
+Interactive Brokers, IBKR, Trader Workstation, and IB Gateway are trademarks of Interactive Brokers LLC. This project is not affiliated with Interactive Brokers or Nautech Systems.
+
 ## Layout
 
 ```
 src/gex_service/
   config.py      Settings (env prefix GEX_)
-  ib_client.py   IB connection, reconnect, market data type, line accounting
-  chain.py       underlying/chain discovery, batched market data, ChainRow/ChainSnapshot
-  greeks.py      vectorised Black-Scholes gamma
-  gex.py         GEX aggregation, walls, zero-gamma grid, max pain, by-expiry
+  ib_client.py   Nautilus HistoricInteractiveBrokersClient session, reconnect, IB line/hist pacing
+  chain.py       underlying/chain discovery, batched market data, ADV, IV/HV history
+  greeks.py      vectorised Black-Scholes gamma / delta / vanna / charm
+  gex.py         GEX aggregation, walls, zero-gamma grid, roll-off, companion exposures
+  scenarios.py   spot × IV × time hedging-pressure surface
+  surface.py     IV smile, 25Δ risk reversal, butterfly, IV rank
+  analytics.py   drift, realized, validation, backtest, scan, complex, OI estimate, features
+  flow.py        Lee-Ready RTVolume flow GEX (opt-in, line-budgeted)
+  alerts.py      edge-triggered rules + webhook
   models.py      pydantic response models
-  store.py       SQLite snapshot history
-  scheduler.py   watch list, cache, serial refresh loop, WS fan-out
-  api.py         FastAPI routes
+  store.py       SQLite snapshots, EOD archive, alerts, OI reconcile
+  scheduler.py   watch list, cache, serial refresh, EOD archive
+  api.py / api_ext.py   FastAPI routes
+  cli.py         gex-export (offline feature CSV)
   main.py        entry point
 deploy/
   com.gex.service.plist.template, gex_ctl.sh, bootstrap_venv.sh
-tests/           unit tests for greeks, GEX math, chain selection, API (IB mocked)
+tests/
 ```

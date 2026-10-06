@@ -100,6 +100,19 @@ class ImpliedMove(BaseModel):
     iv_daily_move_pct: float | None  # atm_iv / sqrt(252) * 100
 
 
+class RollOffScenario(BaseModel):
+    """Profile after a set of expiries drops off (what the book looks like post-expiry)."""
+
+    name: str  # drop_nearest | drop_week | custom
+    excluded_expiries: list[str]
+    abs_gex_removed_share: float  # share of |GEX| that expires with them (0..1)
+    total_gex: float
+    zero_gamma: float | None
+    call_wall: float | None
+    put_wall: float | None
+    regime: str
+
+
 class Concentration(BaseModel):
     absolute_gamma_strike: float | None  # strike with the largest |call_gex| + |put_gex|
     top_strikes: list[float]  # top 5 strikes by absolute gamma
@@ -137,6 +150,14 @@ class Meta(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class IVContext(BaseModel):
+    iv30: float | None
+    iv30_rank_1y: float | None
+    iv30_percentile_1y: float | None
+    hv30: float | None
+    iv_hv_spread: float | None
+
+
 class GexResponse(BaseModel):
     symbol: str
     sec_type: str
@@ -145,11 +166,13 @@ class GexResponse(BaseModel):
     oi_asof: str
     params: ParamsOut
     summary: Summary
+    iv_context: IVContext | None = None
     exposures: Exposures | None = None
     hedge_flow: HedgeFlow | None = None
     volume_lens: VolumeLens | None = None
     implied_move: ImpliedMove | None = None
     concentration: Concentration | None = None
+    roll_off: list[RollOffScenario] = Field(default_factory=list)
     profile: list[StrikeLevel]
     gamma_curve: list[CurvePoint]
     by_expiry: list[ExpiryStats]

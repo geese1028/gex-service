@@ -11,6 +11,7 @@ from gex_service.chain import (
     select_expiries,
     ticker_to_row,
 )
+from gex_service.config import Settings
 from gex_service.ib_client import is_rth_now
 
 NOW = datetime(2026, 10, 5, 10, 30, tzinfo=NY)  # Monday during RTH
@@ -70,6 +71,15 @@ def test_oi_as_of_is_previous_trading_day():
     assert oi_as_of(tuesday) == "2026-10-05"
 
 
+def test_default_client_id_matches_nautilus():
+    assert Settings(_env_file=None).ib_client_id == 1
+
+
+def test_batch_size_clamped_to_ib_line_ceiling():
+    s = Settings(_env_file=None, batch_size=200, max_md_lines=100)
+    assert s.batch_size == 100
+
+
 def test_is_rth_now():
     assert is_rth_now(NOW)
     assert not is_rth_now(datetime(2026, 10, 5, 8, 0, tzinfo=NY))
@@ -85,6 +95,66 @@ def test_fill_iv_from_counterpart():
     assert fill_iv_from_counterpart([c, p, lonely]) == 1
     assert c.iv == 0.19 and c.gamma is None and c.has_gex_inputs
     assert lonely.iv is None and not lonely.has_gex_inputs
+
+
+def test_tick_collector_maps_option_ticks():
+    from gex_service.ib_client import TickCollector
+
+    c = TickCollector()
+    c.on_price(7, 1, 1.2)
+    c.on_price(7, 2, 1.4)
+    c.on_size(7, 27, 1500)
+    c.on_greeks(7, 13, 0.21, 0.55, 0.012)
+    snap = c.by_req[7]
+    assert snap.bid == 1.2 and snap.ask == 1.4
+    assert snap.call_oi == 1500 and snap.iv == 0.21 and snap.gamma == 0.012
+
+
+def test_option_computation_field_order():
+    from gex_service.ib_client import parse_option_computation
+
+    # tickAttrib, impliedVol, delta, optPrice, pvDividend, gamma, vega, theta, undPrice
+    implied, delta, gamma = parse_option_computation(0, 0.21, 0.55, 1.2, 0.0, 0.012, 0.08, -0.04, 500.0)
+    assert (implied, delta, gamma) == (0.21, 0.55, 0.012)
+
+
+def test_option_volume_is_not_double_counted():
+    from gex_service.ib_client import TickCollector
+
+    trade_first = TickCollector()
+    trade_first.on_size(1, 8, 100)
+    trade_first.on_size(1, 29, 100)
+    assert trade_first.by_req[1].volume == 100
+
+    side_first = TickCollector()
+    side_first.on_size(1, 29, 40)
+    side_first.on_size(1, 8, 40)
+    assert side_first.by_req[1].volume == 40
+
+
+def test_expiry_uses_last_trade_date_not_new_york_shift():
+    from datetime import timezone
+
+    from gex_service.ib_client import option_expiry_yyyymmdd
+
+    # Nautilus fallback is midnight UTC, which is the previous evening in New York.
+    midnight_utc = datetime(2026, 10, 9, 0, 0, tzinfo=timezone.utc)
+    assert option_expiry_yyyymmdd("", midnight_utc) == "20261009"
+    assert option_expiry_yyyymmdd("20261016", midnight_utc) == "20261016"
+
+
+def test_market_data_batch_leaves_room_for_open_lines():
+    from gex_service.ib_client import market_data_batch_size
+
+    assert market_data_batch_size(100, 100, 0) == 100
+    assert market_data_batch_size(100, 100, 12) == 88
+    assert market_data_batch_size(100, 100, 100) == 0
+
+
+def test_daily_hist_bar_date_stays_yyyymmdd():
+    from gex_service.ib_client import ib_hist_bar_datetime
+
+    assert ib_hist_bar_datetime("20261005").date().isoformat() == "2026-10-05"
 
 
 def test_ticker_to_row_maps_fields_and_oi_by_right():

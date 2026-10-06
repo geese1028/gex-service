@@ -11,11 +11,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
-from .chain import ChainError, ChainFetcher, ChainParams, ChainSnapshot
+from .chain import NY, ChainError, ChainFetcher, ChainParams, ChainSnapshot
 from .config import Settings
 from .gex import compute_gex
 from .models import GexResponse, WatchEntry
@@ -24,6 +24,7 @@ from .store import SnapshotStore
 log = logging.getLogger(__name__)
 
 Listener = Callable[[GexResponse], Awaitable[None]]
+ResultHook = Callable[["WatchState", GexResponse], Awaitable[None]]
 
 
 @dataclass
@@ -51,6 +52,9 @@ class Scheduler:
         self._watch: dict[str, WatchState] = {}
         self._task: asyncio.Task | None = None
         self._stopping = False
+        # Called after every successful refresh (alerts, OI reconciliation, ...).
+        self.result_hooks: list[ResultHook] = []
+        self._eod_done: set[tuple[str, str]] = set()
 
     # ------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -124,9 +128,8 @@ class Scheduler:
         async with state.refreshing:
             s = self.settings
             try:
-                snapshot = await asyncio.wait_for(
-                    self.fetcher.fetch(state.symbol, state.params), timeout=s.fetch_timeout_s
-                )
+                # The fetcher applies fetch_timeout_s to the fetch itself (not to queueing).
+                snapshot = await self.fetcher.fetch(state.symbol, state.params)
                 result = compute_gex(snapshot, s.risk_free_rate, s.dividend_yield)
             except asyncio.TimeoutError:
                 state.last_error = f"fetch timed out after {s.fetch_timeout_s:.0f}s"
@@ -146,7 +149,23 @@ class Scheduler:
             except Exception as exc:  # noqa: BLE001
                 log.warning("snapshot save failed for %s: %s", state.symbol, exc)
             await self._notify(state, result)
+            for hook in list(self.result_hooks):
+                try:
+                    await hook(state, result)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("result hook %s failed for %s: %s", getattr(hook, "__name__", hook), state.symbol, exc)
             return result
+
+    def filtered_result(self, state: WatchState, exclude_expiries: tuple[str, ...]) -> GexResponse | None:
+        """Recompute from the cached snapshot without the given expiries (no Gateway round-trip)."""
+        if state.snapshot is None:
+            return None
+        rows = [r for r in state.snapshot.rows if r.expiry not in exclude_expiries]
+        snap = replace(state.snapshot, rows=rows, expirations=[e for e in state.snapshot.expirations if e not in exclude_expiries])
+        s = self.settings
+        result = compute_gex(snap, s.risk_free_rate, s.dividend_yield)
+        result.meta.warnings = list(result.meta.warnings) + [f"excluded expiries: {', '.join(exclude_expiries)}"]
+        return result
 
     async def get_or_fetch(self, symbol: str, params: ChainParams | None, force: bool = False) -> GexResponse:
         state = self.ensure(symbol, params)
@@ -180,6 +199,38 @@ class Scheduler:
         for listener in dead:
             state.listeners.discard(listener)
 
+    # ------------------------------------------------------------------ EOD
+    def _eod_times(self, now_ny: datetime) -> tuple[datetime, datetime]:
+        hh, mm = (int(x) for x in self.settings.eod_archive_time.split(":"))
+        archive_at = now_ny.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
+        return archive_at, close
+
+    async def archive_eod(self, now: datetime | None = None, force: bool = False) -> list[str]:
+        """Archive the last pre-close snapshot of every watched symbol once per session."""
+        now_ny = (now or datetime.now(tz=timezone.utc)).astimezone(NY)
+        archive_at, close = self._eod_times(now_ny)
+        if now_ny.weekday() >= 5 or (now_ny < archive_at and not force):
+            return []
+        day = now_ny.date().isoformat()
+        archived: list[str] = []
+        for symbol in self.watched():
+            key = (symbol, day)
+            if key in self._eod_done:
+                continue
+            if await self.store.eod_payload(symbol, day) is not None:
+                self._eod_done.add(key)
+                continue
+            payload = await self.store.last_payload_before(symbol, close if not force else now_ny)
+            day_start = now_ny.replace(hour=0, minute=0, second=0, microsecond=0)
+            if payload is None or payload.ts.astimezone(NY) < day_start:
+                continue  # nothing from today's session
+            await self.store.save_eod(payload, day)
+            self._eod_done.add(key)
+            archived.append(symbol)
+            log.info("EOD archived %s for %s (snapshot %s)", symbol, day, payload.ts.isoformat())
+        return archived
+
     # ----------------------------------------------------------------- loop
     def _evict_idle(self) -> None:
         now = time.monotonic()
@@ -212,6 +263,10 @@ class Scheduler:
                         log.warning("refresh %s failed: %s", symbol, exc)
                     if self._stopping:
                         return
+            try:
+                await self.archive_eod()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("EOD archive failed: %s", exc)
             if time.monotonic() - last_prune > 3600:
                 try:
                     await self.store.prune()

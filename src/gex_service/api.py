@@ -6,15 +6,19 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .chain import ChainError, ChainFetcher, ChainParams
+from .alerts import AlertManager
+from .api_ext import register_extensions
+from .analytics import actual_oi_up_to, oi_totals_for_reconcile
+from .chain import NY, ChainError, ChainFetcher, ChainParams
 from .config import Settings, get_settings
+from .flow import FlowTracker
 from .gex import chain_response
 from .ib_client import IBClient
 from .models import ChainResponse, GexResponse, HealthResponse, HistoryPoint, WatchEntry
@@ -31,7 +35,12 @@ class AppState:
         self.fetcher = ChainFetcher(self.client, settings)
         self.store = SnapshotStore(settings.db_path, settings.snapshot_retention_days)
         self.scheduler = Scheduler(self.fetcher, self.store, settings)
+        self.alerts = AlertManager(self.store, settings.alert_webhook_url)
+        self.flow = FlowTracker(self.client, settings.flow_max_symbols, settings.flow_strikes_per_side)
         self.started_at = time.time()
+        self.scheduler.result_hooks.append(self._alert_hook)
+        self.scheduler.result_hooks.append(self._oi_hook)
+        self.scheduler.result_hooks.append(self._flow_hook)
 
     async def start(self) -> None:
         await self.store.open()
@@ -40,8 +49,33 @@ class AppState:
 
     async def stop(self) -> None:
         await self.scheduler.stop()
+        await self.flow.stop_all()
+        await self.alerts.close()
         await self.client.stop()
         await self.store.close()
+
+    # ------------------------------------------------------------ hooks
+    async def _alert_hook(self, _state, result: GexResponse) -> None:
+        await self.alerts.on_result(result)
+
+    async def _oi_hook(self, state, result: GexResponse) -> None:
+        snapshot = state.snapshot
+        if snapshot is None:
+            return
+        today = result.ts.astimezone(NY).date()
+        day = today.isoformat()
+        for pending in await self.store.pending_oi_reconcile(result.symbol, day):
+            if pending["max_expiry"]:
+                actual = actual_oi_up_to(snapshot, pending["max_expiry"], date.fromisoformat(pending["date"]))
+                await self.store.reconcile_oi(result.symbol, pending["date"], actual)
+        prev_oi, volume, max_expiry = oi_totals_for_reconcile(snapshot, today)
+        if max_expiry:
+            await self.store.save_oi_estimate(result.symbol, day, prev_oi, volume, self.settings.oi_opening_ratio, max_expiry)
+
+    async def _flow_hook(self, _state, result: GexResponse) -> None:
+        flow = self.flow.get(result.symbol)
+        if flow is not None:
+            flow.update_spot(result.spot)
 
 
 def _rss_mb() -> float | None:
@@ -158,10 +192,21 @@ def create_app(settings: Settings | None = None, state: AppState | None = None) 
         expiries: str | None = Query(None, description="comma separated YYYYMMDD"),
         refresh: bool = Query(False),
         wait: bool = Query(True, description="block until data is ready; false returns 202 while a fetch runs"),
+        exclude_expiries: str | None = Query(None, description="comma separated YYYYMMDD to drop from the cached chain"),
     ):
         params = parse_params(max_dte, strike_range_pct, max_contracts, expiries)
         sym = _symbol(symbol)
         scheduler = st().scheduler
+        if exclude_expiries:
+            excl = tuple(p.strip() for p in exclude_expiries.split(",") if p.strip())
+            for p in excl:
+                if len(p) != 8 or not p.isdigit():
+                    raise HTTPException(status_code=422, detail=f"expiry {p!r} must be YYYYMMDD")
+            await scheduler.get_or_fetch(sym, params, force=refresh)
+            result = scheduler.filtered_result(scheduler.ensure(sym, params), excl)
+            if result is None:
+                raise HTTPException(status_code=404, detail="no chain snapshot")
+            return result
         if not wait:
             state = scheduler.ensure(sym, params)
             if state.result is not None and not refresh:
@@ -264,6 +309,7 @@ def create_app(settings: Settings | None = None, state: AppState | None = None) 
         finally:
             s.scheduler.unsubscribe(sym, listener)
 
+    register_extensions(api, app, settings, st, _symbol, _safe_refresh)
     app.include_router(api)
     return app
 

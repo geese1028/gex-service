@@ -38,8 +38,10 @@ from .models import (
     GexResponse,
     HedgeFlow,
     ImpliedMove,
+    IVContext,
     Meta,
     ParamsOut,
+    RollOffScenario,
     StrikeLevel,
     Summary,
     VolumeLens,
@@ -300,13 +302,62 @@ def _concentration(profile: list[StrikeLevel], inp: _Inputs) -> Concentration:
     )
 
 
+def _regime(total_gex: float) -> str:
+    if abs(total_gex) < 1e-9:
+        return "flat"
+    return "positive_gamma" if total_gex > 0 else "negative_gamma"
+
+
+def _subset_levels(inp: _Inputs, keep: np.ndarray, spot: float, r: float, q: float) -> tuple[float, float | None, float | None, float | None]:
+    """Total GEX, zero gamma and walls for the contracts selected by ``keep``."""
+    if not keep.any():
+        return 0.0, None, None, None
+    idx = np.where(keep)[0]
+    profile = build_profile(inp, idx)
+    cw, pw, _, _ = _walls(profile)
+    total = float(inp.gex[idx].sum())
+    sub = _Inputs([inp.rows[i] for i in idx], spot, r, q)
+    curves = _grid_curves(sub, spot, r, q, sub.oi)
+    zero = _find_zero_crossing(curves[0], curves[1], spot) if curves else zero_gamma_from_profile(profile, spot)
+    return total, zero, cw, pw
+
+
+def roll_off_scenarios(inp: _Inputs, spot: float, r: float, q: float) -> list[RollOffScenario]:
+    """What the book looks like after the nearest expiry, and after everything within a week, drops off."""
+    if not inp.rows:
+        return []
+    expiries = sorted({row.expiry for row in inp.rows})
+    dte_by_exp = {e: next(row.dte for row in inp.rows if row.expiry == e) for e in expiries}
+    abs_total = float(np.abs(inp.gex).sum())
+    scenarios: list[RollOffScenario] = []
+    candidates = [("drop_nearest", [expiries[0]]), ("drop_week", [e for e in expiries if dte_by_exp[e] <= 7.0])]
+    seen: set[tuple[str, ...]] = set()
+    for name, excluded in candidates:
+        if not excluded or tuple(excluded) in seen or len(excluded) == len(expiries):
+            continue
+        seen.add(tuple(excluded))
+        keep = np.array([row.expiry not in excluded for row in inp.rows])
+        removed = float(np.abs(inp.gex[~keep]).sum())
+        total, zero, cw, pw = _subset_levels(inp, keep, spot, r, q)
+        scenarios.append(
+            RollOffScenario(
+                name=name,
+                excluded_expiries=excluded,
+                abs_gex_removed_share=(removed / abs_total) if abs_total > 0 else 0.0,
+                total_gex=total,
+                zero_gamma=zero,
+                call_wall=cw,
+                put_wall=pw,
+                regime=_regime(total),
+            )
+        )
+    return scenarios
+
+
 def _hedge_flow(total_gex: float, spot: float, adv: float | None, zero_gamma: float | None) -> HedgeFlow:
     shares = total_gex / spot if spot > 0 else 0.0
     pct_adv = (abs(shares) / adv * 100) if adv and adv > 0 else None
-    if abs(total_gex) < 1e-9:
-        regime = "flat"
-    else:
-        regime = "positive_gamma" if total_gex > 0 else "negative_gamma"
+    regime = _regime(total_gex)
     if regime == "positive_gamma":
         note = "dealers sell into rallies and buy dips: hedging dampens moves (mean reversion)"
     elif regime == "negative_gamma":
@@ -321,6 +372,21 @@ def _hedge_flow(total_gex: float, spot: float, adv: float | None, zero_gamma: fl
         regime=regime,
         distance_to_zero_gamma_pct=dist,
         direction_note=note,
+    )
+
+
+def _iv_context(snapshot: ChainSnapshot) -> IVContext | None:
+    from .surface import iv_stats  # local import: surface depends on chain, not on gex
+
+    stats = iv_stats(snapshot.iv30_history, snapshot.hv30_history)
+    if stats is None:
+        return None
+    return IVContext(
+        iv30=stats.iv30,
+        iv30_rank_1y=stats.iv30_rank_1y,
+        iv30_percentile_1y=stats.iv30_percentile_1y,
+        hv30=stats.hv30,
+        iv_hv_spread=stats.iv_hv_spread,
     )
 
 
@@ -432,11 +498,13 @@ def compute_gex(snapshot: ChainSnapshot, r: float, q: float, now: datetime | Non
             dividend_yield=q,
         ),
         summary=summary,
+        iv_context=_iv_context(snapshot),
         exposures=exposures,
         hedge_flow=_hedge_flow(total_gex, spot, snapshot.adv_shares, zero),
         volume_lens=_volume_lens(inp, spot, r, q) if rows else None,
         implied_move=_implied_move(snapshot.rows, spot),
         concentration=_concentration(profile, inp),
+        roll_off=roll_off_scenarios(inp, spot, r, q),
         profile=profile,
         gamma_curve=curve,
         by_expiry=by_expiry,

@@ -1,0 +1,28 @@
+gex-service
+Copyright (c) 2026 geese1028
+
+This project is licensed under the MIT License. See the LICENSE file.
+
+Third-party software
+--------------------
+
+NautilusTrader
+Copyright (c) 2015-2026 Nautech Systems Pty Ltd
+https://nautilustrader.io/
+https://github.com/nautechsystems/nautilus_trader
+
+The IBKR connection in this service is the NautilusTrader Interactive Brokers
+adapter, imported as the nautilus_trader package (HistoricInteractiveBrokersClient,
+InteractiveBrokersInstrumentProvider, and the related IB data client).
+NautilusTrader is licensed under the GNU Lesser General Public License v3.0.
+This repository does not include NautilusTrader source code and does not
+change its license. Use, modification, and distribution of NautilusTrader
+remain under the LGPL-3.0 terms published by Nautech Systems Pty Ltd.
+
+Trademarks
+----------
+
+Interactive Brokers, IBKR, Trader Workstation (TWS), and IB Gateway are
+trademarks of Interactive Brokers LLC. This project is an independent client
+and is not affiliated with, endorsed by, or sponsored by Interactive Brokers
+or Nautech Systems.

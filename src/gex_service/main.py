@@ -15,9 +15,9 @@ def configure_logging(level: str) -> None:
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    # ib_async is chatty about per-contract "no security definition" notices.
-    logging.getLogger("ib_async.wrapper").setLevel(logging.ERROR)
-    logging.getLogger("ib_async.client").setLevel(logging.WARNING)
+    # Nautilus IB adapter is chatty about per-contract notices and farm status.
+    logging.getLogger("nautilus_trader.adapters.interactive_brokers").setLevel(logging.WARNING)
+    logging.getLogger("ibapi").setLevel(logging.ERROR)
 
 
 def run() -> None:
