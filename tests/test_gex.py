@@ -125,3 +125,51 @@ def test_by_expiry_split_and_chain_response():
     assert by_id[1].gex is not None and by_id[1].gex > 0
     assert by_id[2].gex is not None and by_id[2].gex < 0
     assert by_id[3].gex is None
+
+
+def test_zero_dte_walls_ignore_later_expiries():
+    rows = [
+        row(1, "20261005", 0.2, 105.0, "C", oi=5000),
+        row(2, "20261005", 0.2, 95.0, "P", oi=5000),
+        row(3, "20261016", 11.0, 80.0, "C", oi=50000),
+        row(4, "20261016", 11.0, 70.0, "P", oi=50000),
+    ]
+    res = compute_gex(make_snapshot(rows, spot=100.0), r=0.0, q=0.0)
+    book = res.zero_dte
+    assert book is not None and book.expiry == "20261005"
+    assert book.call_wall == 105.0
+    assert book.put_wall == 95.0
+    assert book.abs_gex_share < 1.0
+    assert book.in_walls is True
+    assert book.hours_left == 6.0
+
+
+def test_charm_clock_buys_as_otm_calls_expire():
+    rows = [row(1, "20261005", 0.25, 102.0, "C", oi=5000, iv=0.4)]
+    res = compute_gex(make_snapshot(rows, spot=100.0), r=0.0, q=0.0)
+    clock = res.charm_clock
+    assert clock is not None
+    assert clock.direction == "buy" and clock.shares_to_close > 0
+    assert clock.pin_strike == 102.0
+
+
+def test_charm_clock_is_done_after_the_close():
+    rows = [row(1, "20261005", 0.2, 120.0, "C", oi=1000)]
+    late = datetime(2026, 10, 5, 16, 30, tzinfo=NY)
+    res = compute_gex(make_snapshot(rows, spot=100.0), r=0.0, q=0.0, now=late)
+    assert res.charm_clock is not None
+    assert res.charm_clock.hours_left == 0.0
+    assert res.charm_clock.direction == "flat"
+    assert res.charm_clock.shares_to_close == 0.0
+
+
+def test_vanna_play_is_the_opposite_of_a_vol_point():
+    rows = [
+        row(1, "20261016", 11.0, 100.0, "C", oi=1000),
+        row(2, "20261016", 11.0, 100.0, "P", oi=1000),
+    ]
+    res = compute_gex(make_snapshot(rows, spot=100.0), r=0.0, q=0.0)
+    play = res.vanna_play
+    assert play is not None and res.exposures is not None
+    assert abs(play.shares_if_iv_up_1pt + play.shares_if_iv_down_1pt) < 1e-6
+    assert abs(play.shares_if_iv_down_1pt - (res.exposures.vex / 100.0)) < 1e-6

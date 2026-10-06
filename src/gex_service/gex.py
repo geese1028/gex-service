@@ -26,7 +26,7 @@ from datetime import datetime
 
 import numpy as np
 
-from .chain import ChainRow, ChainSnapshot
+from .chain import NY, ChainRow, ChainSnapshot
 from .greeks import bs_charm, bs_delta, bs_gamma, bs_vanna, years_from_days
 from .models import (
     ChainResponse,
@@ -37,6 +37,7 @@ from .models import (
     Exposures,
     GexResponse,
     HedgeFlow,
+    CharmClock,
     ImpliedMove,
     IVContext,
     Meta,
@@ -44,7 +45,9 @@ from .models import (
     RollOffScenario,
     StrikeLevel,
     Summary,
+    VannaPlay,
     VolumeLens,
+    ZeroDteBook,
 )
 
 log = logging.getLogger(__name__)
@@ -390,6 +393,176 @@ def _iv_context(snapshot: ChainSnapshot) -> IVContext | None:
     )
 
 
+def _hours_until_close(now: datetime) -> float:
+    """Hours from ``now`` until 16:00 ET. Zero once the cash close has passed."""
+    local = now.astimezone(NY)
+    close = local.replace(hour=16, minute=0, second=0, microsecond=0)
+    return max(0.0, (close - local).total_seconds() / 3600.0)
+
+
+def _versus(spot: float, level: float | None) -> str:
+    if level is None or spot <= 0:
+        return "unknown"
+    if abs(spot - level) / spot < 0.0005:
+        return "at"
+    return "above" if spot > level else "below"
+
+
+def _hedge_shares_to(total_gex: float, spot: float, level: float | None) -> float | None:
+    """Linear dealer hedge, in shares, to travel from spot to ``level``.
+
+    Positive means dealers buy the underlying along the way. GEX is the dollar
+    delta change per 1% move, so the share change per 1% is GEX/spot and the
+    dealer hedge is the opposite of that change.
+    """
+    if level is None or spot <= 0:
+        return None
+    dealer_share_change = (total_gex / spot) * ((level - spot) / spot)
+    return -dealer_share_change
+
+
+def _zero_dte_book(inp: _Inputs, spot: float, r: float, q: float, hours_left: float) -> ZeroDteBook:
+    mask = np.array([row.dte < 1.0 for row in inp.rows], dtype=bool) if inp.rows else np.array([], dtype=bool)
+    if mask.size == 0 or not mask.any():
+        return ZeroDteBook(
+            expiry=None, dte=None, hours_left=round(hours_left, 2), total_gex=0.0, abs_gex_share=0.0,
+            regime="flat", call_wall=None, put_wall=None, zero_gamma=None, spot_vs_zero_gamma="unknown",
+            in_walls=None, shares_per_1pct=0.0, hedge_shares_to_call_wall=None, hedge_shares_to_put_wall=None,
+            entry_note="No contracts expiring today. Use the full-chain walls.",
+        )
+    total, zero, call_wall, put_wall = _subset_levels(inp, mask, spot, r, q)
+    abs_total = float(np.abs(inp.gex).sum())
+    share = float(np.abs(inp.gex[mask]).sum()) / abs_total if abs_total > 0 else 0.0
+    expiry = min((inp.rows[i].expiry for i in np.where(mask)[0]), default=None)
+    dte = float(min(inp.rows[i].dte for i in np.where(mask)[0]))
+    regime = _regime(total)
+    in_walls = None
+    if call_wall is not None and put_wall is not None:
+        lo, hi = min(put_wall, call_wall), max(put_wall, call_wall)
+        in_walls = lo <= spot <= hi
+    shares = abs(total / spot) if spot > 0 else 0.0
+    side = _versus(spot, zero)
+    if regime == "positive_gamma" and in_walls:
+        note = (
+            f"Spot is inside today's walls and gamma is positive. "
+            f"Fades back toward zero gamma {zero:g} have the hedge with them."
+            if zero is not None else
+            "Spot is inside today's walls and gamma is positive. Fades back into the range have the hedge with them."
+        )
+    elif regime == "positive_gamma" and side == "above":
+        note = "Spot is above today's zero gamma while gamma is positive. Rallies are sold back toward it."
+    elif regime == "positive_gamma" and side == "below":
+        note = "Spot is below today's zero gamma while gamma is positive. Dips are bought back toward it."
+    elif regime == "negative_gamma":
+        note = "Today's book is negative gamma. Moves away from zero gamma are chased, not faded."
+    elif regime == "positive_gamma":
+        note = "Today's gamma is positive. Fades back inside the call and put walls have the hedge with them."
+    else:
+        note = "Today's expiring book has no meaningful gamma."
+    return ZeroDteBook(
+        expiry=expiry,
+        dte=round(dte, 3),
+        hours_left=round(hours_left, 2),
+        total_gex=total,
+        abs_gex_share=share,
+        regime=regime,
+        call_wall=call_wall,
+        put_wall=put_wall,
+        zero_gamma=zero,
+        spot_vs_zero_gamma=side,
+        in_walls=in_walls,
+        shares_per_1pct=shares,
+        hedge_shares_to_call_wall=_hedge_shares_to(total, spot, call_wall),
+        hedge_shares_to_put_wall=_hedge_shares_to(total, spot, put_wall),
+        entry_note=note,
+    )
+
+
+def _terminal_delta(spot: float, strike: float, is_call: bool) -> float:
+    if is_call:
+        return 1.0 if spot > strike else (0.5 if spot == strike else 0.0)
+    return -1.0 if spot < strike else (-0.5 if spot == strike else 0.0)
+
+
+def _charm_clock(inp: _Inputs, spot: float, r: float, q: float, hours_left: float) -> CharmClock:
+    """Reprice each contract's delta at the cash close and sum the dealer hedge."""
+    day_frac = hours_left / 24.0
+    by_strike: dict[float, float] = defaultdict(float)
+    hedge = 0.0
+    expiring_only = False
+    if hours_left > 0 and inp.rows:
+        changes: list[tuple[int, float]] = []
+        for i, row in enumerate(inp.rows):
+            if not inp.has_iv[i]:
+                continue
+            delta_now = float(bs_delta(spot, row.strike, years_from_days(row.dte), float(inp.iv[i]), row.right == "C", r, q))
+            remaining = row.dte - day_frac
+            if remaining <= 1e-8:
+                delta_later = _terminal_delta(spot, row.strike, row.right == "C")
+            else:
+                delta_later = float(bs_delta(spot, row.strike, years_from_days(remaining), float(inp.iv[i]), row.right == "C", r, q))
+            share_change = inp.sign[i] * (delta_later - delta_now) * inp.oi[i] * inp.mult[i]
+            changes.append((i, -float(share_change)))
+        expiring = [pair for pair in changes if inp.rows[pair[0]].dte - day_frac <= 1e-6]
+        used = expiring if expiring else changes
+        expiring_only = bool(expiring)
+        for i, dealer_hedge in used:
+            hedge += dealer_hedge
+            by_strike[inp.rows[i].strike] += dealer_hedge
+    pin = max(by_strike.items(), key=lambda kv: abs(kv[1]))[0] if by_strike else None
+    if hours_left <= 0 or abs(hedge) < 1.0:
+        direction = "flat"
+    elif hedge > 0:
+        direction = "buy"
+    else:
+        direction = "sell"
+    side = _versus(spot, pin)
+    if direction == "flat":
+        note = "Cash close has passed, or time decay does not move the hedge." if hours_left <= 0 else "Time decay into the close does not move the dealer hedge."
+    else:
+        book = "today's expiring contracts" if expiring_only else "the nearest contracts"
+        verb = "buy" if direction == "buy" else "sell"
+        where = f" toward {pin:g}" if pin is not None else ""
+        note = f"If spot stays here, dealers {verb} about {abs(hedge):,.0f} shares into 16:00 ET{where} ({book})."
+    return CharmClock(
+        hours_left=round(hours_left, 2),
+        shares_to_close=hedge,
+        direction=direction,
+        pin_strike=pin,
+        spot_vs_pin=side,
+        entry_note=note,
+    )
+
+
+def _vanna_play(exposures: Exposures, spot: float) -> VannaPlay:
+    up = -exposures.vex / spot if spot > 0 else 0.0
+    down = -up
+    side = _versus(spot, exposures.vanna_flip)
+    distance = ((exposures.vanna_flip - spot) / spot * 100) if exposures.vanna_flip is not None and spot > 0 else None
+    if abs(down) < 1.0:
+        note = "A one-point IV move does not change the dealer hedge."
+    elif down > 0:
+        note = (
+            f"A 1-point IV drop has dealers buying about {down:,.0f} shares; a 1-point rise has them selling the same. "
+            f"Long entries want the crush."
+        )
+    else:
+        note = (
+            f"A 1-point IV drop has dealers selling about {abs(down):,.0f} shares; a 1-point rise has them buying the same. "
+            f"Long entries are working against a vol crush."
+        )
+    if exposures.vanna_flip is not None:
+        note += f" Vanna flips at {exposures.vanna_flip:g}; spot is {side} it."
+    return VannaPlay(
+        vanna_flip=exposures.vanna_flip,
+        spot_vs_flip=side,
+        distance_pct=distance,
+        shares_if_iv_down_1pt=down,
+        shares_if_iv_up_1pt=up,
+        entry_note=note,
+    )
+
+
 # ------------------------------------------------------------------ main entry
 
 
@@ -457,6 +630,7 @@ def compute_gex(snapshot: ChainSnapshot, r: float, q: float, now: datetime | Non
     put_gex_total = float(gex[gex < 0].sum()) if gex.size else 0.0
     total_gex = call_gex_total + put_gex_total
 
+    as_of = now or snapshot.ts
     now = now or datetime.now(tz=snapshot.ts.tzinfo)
     summary = Summary(
         total_gex=total_gex,
@@ -474,6 +648,7 @@ def compute_gex(snapshot: ChainSnapshot, r: float, q: float, now: datetime | Non
         put_call_oi_ratio=(total_put_oi / total_call_oi) if total_call_oi > 0 else None,
         curve_gex_at_spot=at_spot,
     )
+    hours_left = _hours_until_close(as_of)
     exposures = Exposures(
         dex=float(inp.dex.sum()) if rows else 0.0,
         dex_shares=(float(inp.dex.sum()) / spot) if rows and spot > 0 else 0.0,
@@ -505,6 +680,9 @@ def compute_gex(snapshot: ChainSnapshot, r: float, q: float, now: datetime | Non
         implied_move=_implied_move(snapshot.rows, spot),
         concentration=_concentration(profile, inp),
         roll_off=roll_off_scenarios(inp, spot, r, q),
+        zero_dte=_zero_dte_book(inp, spot, r, q, hours_left),
+        charm_clock=_charm_clock(inp, spot, r, q, hours_left),
+        vanna_play=_vanna_play(exposures, spot),
         profile=profile,
         gamma_curve=curve,
         by_expiry=by_expiry,

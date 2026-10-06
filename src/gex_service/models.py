@@ -113,6 +113,48 @@ class RollOffScenario(BaseModel):
     regime: str
 
 
+class ZeroDteBook(BaseModel):
+    """Walls and zero gamma of the contracts that expire today."""
+
+    expiry: str | None
+    dte: float | None
+    hours_left: float
+    total_gex: float
+    abs_gex_share: float
+    regime: str
+    call_wall: float | None
+    put_wall: float | None
+    zero_gamma: float | None
+    spot_vs_zero_gamma: str  # above | below | at | unknown
+    in_walls: bool | None
+    shares_per_1pct: float
+    hedge_shares_to_call_wall: float | None  # signed; positive = dealers buy on the way there
+    hedge_shares_to_put_wall: float | None
+    entry_note: str
+
+
+class CharmClock(BaseModel):
+    """Dealer hedge from time decay between now and the 16:00 ET cash close."""
+
+    hours_left: float
+    shares_to_close: float  # positive = dealers buy the underlying into the close
+    direction: str  # buy | sell | flat
+    pin_strike: float | None
+    spot_vs_pin: str
+    entry_note: str
+
+
+class VannaPlay(BaseModel):
+    """Dealer hedge if implied vol moves one point, and where that sign flips."""
+
+    vanna_flip: float | None
+    spot_vs_flip: str
+    distance_pct: float | None
+    shares_if_iv_down_1pt: float  # positive = dealers buy
+    shares_if_iv_up_1pt: float
+    entry_note: str
+
+
 class Concentration(BaseModel):
     absolute_gamma_strike: float | None  # strike with the largest |call_gex| + |put_gex|
     top_strikes: list[float]  # top 5 strikes by absolute gamma
@@ -173,6 +215,9 @@ class GexResponse(BaseModel):
     implied_move: ImpliedMove | None = None
     concentration: Concentration | None = None
     roll_off: list[RollOffScenario] = Field(default_factory=list)
+    zero_dte: ZeroDteBook | None = None
+    charm_clock: CharmClock | None = None
+    vanna_play: VannaPlay | None = None
     profile: list[StrikeLevel]
     gamma_curve: list[CurvePoint]
     by_expiry: list[ExpiryStats]
