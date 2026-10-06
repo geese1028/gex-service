@@ -1,6 +1,6 @@
 [project]
 name = "gex-service"
-version = "0.3.0"
+version = "0.4.0"
 description = "IBKR-backed gamma exposure service: GEX, walls, DEX/VEX/CEX, scenarios, IV surface, scan, flow, alerts"
 readme = "README.md"
 requires-python = ">=3.11"

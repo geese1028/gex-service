@@ -36,14 +36,20 @@ Open interest is the prior settle (`oi_asof`). Call-wall open interest changes w
 
 Use only rows for `front_expiry`. Need two sessions before calling a trend. If there is one row, say the wall's location and size and that the slope is not in the database yet.
 
+Before the trend, state two gates:
+
+1. Sign of this week's book. Read `total_gex` on the front expiry (live: that `by_expiry` row). Positive gamma: the call wall can act as a fade, dealers sell rallies into it. Negative gamma: the same strike is not resistance; hedging chases the move and a tag is more likely to run through. Do not recommend scaling out into the wall as a fade when the front book is negative.
+2. Name the underlying. The long-call / short-put convention is the working assumption for index products (SPY, QQQ, SPX, and the same family). For a single name (MSFT, NOW, RKLB, SPCX, and other stocks) say the read is weaker: public open interest does not show who holds the inventory.
+
 Compare the latest row with the prior session of the same expiry:
 
-- Heavier: same call-wall strike, and call open interest or `pct_adv` is higher after `oi_asof` moves. Scale out when price tags the wall (a touch, or spot back at the strike) on Wednesday through Friday. Done by the weekend.
+- Heavier: same call-wall strike, and call open interest or `pct_adv` is higher after `oi_asof` moves. Only if the front book is still positive gamma: scale out when price tags the wall on Wednesday through Friday. Done by the weekend.
 - Lighter or migrated: call open interest or `pct_adv` falls on that strike, or `call_wall` steps up, especially if `volume_call_wall` moved first. Hold through the old strike and watch the new one.
+- Negative: front-book `total_gex` is below zero. Do not fade the call wall. Say a break is the path the hedge amplifies.
 - Too small to lean on: `pct_adv` stays well under about 1% of average daily volume. Say the strike is inventory, not a forced hedge, and do not treat a cross as dealer selling.
 
-Do not use charm or vanna share counts when they are negligible next to average daily volume.
+On the session that expiry dies (the front expiry's calendar date, especially after 14:00 ET), re-read `shares_per_1pct` and `pct_adv` from the live book. The week's open-interest path is the setup. Gamma on that same inventory is much larger in the last hours. If that afternoon hedge is no longer small versus ADV, use it to choose the tag exit or the hold-through. Charm and vanna share counts still stay out of the decision while they are negligible next to ADV. Use them only on that expiry afternoon when their share count is large versus ADV.
 
 ## Reply
 
-State symbol, front expiry, spot, call wall, distance, call-wall open interest, and hedge as percent of ADV. Then one line: heavier, lighter, migrated, or not enough sessions. Then the action that follows from the user's plan (scale out on a tag, or hold through). If the service is down or the symbol was never refreshed, say persistence has not started.
+State symbol, whether it is an index product or a single name, the sign of the front book, front expiry, spot, call wall, distance, call-wall open interest, and hedge as percent of ADV. Then one line: heavier, lighter, migrated, negative, too small, or not enough sessions. Then the action: scale out on a tag only when the book is positive and the wall is heavier; hold through when it is lighter or has migrated; do not fade a negative book. On the expiry afternoon, say whether the live hedge changed that action. If the service is down or the symbol was never refreshed, say persistence has not started.
