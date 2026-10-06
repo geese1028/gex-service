@@ -146,6 +146,8 @@ class Scheduler:
             state.last_error = None
             try:
                 await self.store.save(result, state.params.key())
+                await self.store.upsert_expiry_days(result)
+                await self.store.record_wall_touch(result)
             except Exception as exc:  # noqa: BLE001
                 log.warning("snapshot save failed for %s: %s", state.symbol, exc)
             await self._notify(state, result)
@@ -226,6 +228,7 @@ class Scheduler:
             if payload is None or payload.ts.astimezone(NY) < day_start:
                 continue  # nothing from today's session
             await self.store.save_eod(payload, day)
+            await self.store.upsert_expiry_days(payload, finalized=True)
             self._eod_done.add(key)
             archived.append(symbol)
             log.info("EOD archived %s for %s (snapshot %s)", symbol, day, payload.ts.isoformat())

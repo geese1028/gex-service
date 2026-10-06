@@ -52,6 +52,11 @@ class ExpiryStats(BaseModel):
     cex: float = 0.0
     # Share of the chain's absolute GEX sitting in this expiry (0..1).
     abs_gex_share: float = 0.0
+    # Call-wall inventory for this expiry alone.
+    call_wall_gex: float = 0.0
+    call_wall_oi: float = 0.0
+    volume_call_wall: float | None = None
+    shares_per_1pct: float = 0.0
 
 
 class Exposures(BaseModel):
@@ -249,6 +254,46 @@ class ChainResponse(BaseModel):
     ts: datetime
     oi_asof: str
     rows: list[ChainRowOut]
+
+
+class ExpiryDay(BaseModel):
+    """One session's reading of a single expiry's call wall."""
+
+    date: str
+    expiry: str
+    dte: float | None = None
+    ts: datetime
+    spot: float
+    call_wall: float | None
+    call_wall_gex: float = 0.0
+    call_wall_oi: float = 0.0
+    put_wall: float | None = None
+    abs_gex_share: float = 0.0
+    total_gex: float = 0.0
+    shares_per_1pct: float = 0.0
+    pct_adv: float | None = None
+    volume_call_wall: float | None = None
+    oi_asof: str = ""
+    finalized: bool = False
+
+
+class WallTouch(BaseModel):
+    """Intraday print taken while spot is near the front-week call wall."""
+
+    ts: datetime
+    expiry: str
+    spot: float
+    call_wall: float | None
+    distance_pct: float
+    volume_call_wall: float | None = None
+    call_wall_gex: float = 0.0
+
+
+class WallTrend(BaseModel):
+    symbol: str
+    front_expiry: str | None
+    days: list[ExpiryDay]
+    touches: list[WallTouch]
 
 
 class HistoryPoint(BaseModel):

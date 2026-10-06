@@ -623,10 +623,15 @@ class IBClient:
         underlying: IBContract,
         *,
         max_expiry_days: int,
-        min_expiry_days: int = 0,
+        min_expiry_days: int = -1,
         expiry: str | None = None,
     ):
-        """Official Nautilus chain load: ``IBContract(build_options_chain=True)``."""
+        """Official Nautilus chain load: ``IBContract(build_options_chain=True)``.
+
+        ``min_expiry_days=-1`` keeps today's expiry. Nautilus compares the expiry
+        date at 00:00 UTC with "now", so a same-day expiry falls out of a
+        zero-day minimum once the US session is open.
+        """
         seed = IBContract(
             secType=underlying.secType,
             conId=underlying.conId,
@@ -694,7 +699,8 @@ class IBClient:
         self.require_connected()
         await self._pace_historical()
         spec = bar_spec if contract.secType == "STK" else bar_spec.replace("LAST", "MID")
-        now = datetime.now(tz=timezone.utc)
+        # Nautilus applies tz_name itself and rejects an aware datetime.
+        now = datetime.now(tz=timezone.utc).replace(tzinfo=None)
         bars = await self._historic.request_bars(
             bar_specifications=[spec],
             end_date_time=now,

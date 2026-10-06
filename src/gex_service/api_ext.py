@@ -16,6 +16,7 @@ from .alerts import Alert, AlertConfig
 from .chain import NY, ChainSnapshot
 from .config import Settings
 from .flow import FlowResponse
+from .models import WallTrend
 from .scenarios import ScenarioGrid, scenario_grid
 from .surface import IVSurface, iv_surface
 
@@ -85,6 +86,13 @@ def register_extensions(api: APIRouter, app: FastAPI, settings: Settings, st: Ca
     @api.get("/gex/{symbol}/eod")
     async def get_eod(symbol: str, days: int = Query(60, ge=1, le=1000)) -> list[dict]:
         return await st().store.eod_rows(_symbol(symbol), days)
+
+    @api.get("/gex/{symbol}/walls", response_model=WallTrend)
+    async def get_walls(symbol: str) -> WallTrend:
+        """Daily front-week wall series plus intraday prints taken near the call wall."""
+        sym = _symbol(symbol)
+        front, days, touches = await st().store.wall_trend(sym)
+        return WallTrend(symbol=sym, front_expiry=front, days=days, touches=touches)
 
     @api.post("/eod/archive")
     async def force_eod_archive() -> dict:

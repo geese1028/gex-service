@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 
@@ -393,6 +393,25 @@ def _iv_context(snapshot: ChainSnapshot) -> IVContext | None:
     )
 
 
+def front_week_expiry(by_expiry: list[ExpiryStats], day) -> ExpiryStats | None:
+    """Latest expiry that still falls on or before this week's Friday.
+
+    Daily names keep a same-day book and a Friday book. The week-long wall is the Friday one.
+    """
+    if not by_expiry:
+        return None
+    friday = day + timedelta(days=(4 - day.weekday()) % 7)
+
+    def exp_date(stats: ExpiryStats):
+        return datetime.strptime(stats.expiry, "%Y%m%d").date()
+
+    this_week = [stats for stats in by_expiry if day <= exp_date(stats) <= friday]
+    if this_week:
+        return max(this_week, key=lambda stats: stats.expiry)
+    live = [stats for stats in by_expiry if stats.dte > 0]
+    return min(live, key=lambda stats: stats.dte) if live else None
+
+
 def _hours_until_close(now: datetime) -> float:
     """Hours from ``now`` until 16:00 ET. Zero once the cash close has passed."""
     local = now.astimezone(NY)
@@ -607,11 +626,18 @@ def compute_gex(snapshot: ChainSnapshot, r: float, q: float, now: datetime | Non
         sub_gex = gex[idx]
         call_sum = float(sub_gex[sub_gex > 0].sum())
         put_sum = float(sub_gex[sub_gex < 0].sum())
+        wall_row = next((p for p in sub_profile if p.strike == cw), None) if cw is not None else None
+        vol_by_strike: dict[float, float] = defaultdict(float)
+        for i in idx:
+            if inp.rows[int(i)].right == "C":
+                vol_by_strike[inp.rows[int(i)].strike] += float(inp.gex_vol[int(i)])
+        volume_call_wall = max(vol_by_strike, key=vol_by_strike.get) if any(v > 0 for v in vol_by_strike.values()) else None
+        total_expiry = call_sum + put_sum
         by_expiry.append(
             ExpiryStats(
                 expiry=expiry,
                 dte=round(rows[idx[0]].dte, 3),
-                total_gex=call_sum + put_sum,
+                total_gex=total_expiry,
                 call_gex=call_sum,
                 put_gex=put_sum,
                 call_wall=cw,
@@ -620,6 +646,10 @@ def compute_gex(snapshot: ChainSnapshot, r: float, q: float, now: datetime | Non
                 vex=float(inp.vex[idx].sum()),
                 cex=float(inp.cex[idx].sum()),
                 abs_gex_share=(float(np.abs(sub_gex).sum()) / abs_total) if abs_total > 0 else 0.0,
+                call_wall_gex=wall_row.call_gex if wall_row is not None else 0.0,
+                call_wall_oi=wall_row.call_oi if wall_row is not None else 0.0,
+                volume_call_wall=volume_call_wall,
+                shares_per_1pct=(abs(total_expiry) / spot) if spot > 0 else 0.0,
             )
         )
 

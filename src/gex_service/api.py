@@ -44,6 +44,8 @@ class AppState:
 
     async def start(self) -> None:
         await self.store.open()
+        for symbol, params in await self.store.list_watches():
+            self.scheduler.ensure(symbol, params, pinned=True)
         await self.client.start()
         self.scheduler.start()
 
@@ -254,13 +256,16 @@ def create_app(settings: Settings | None = None, state: AppState | None = None) 
     ) -> WatchEntry:
         params = parse_params(max_dte, strike_range_pct, max_contracts, expiries)
         sym = _symbol(symbol)
-        st().scheduler.ensure(sym, params, pinned=True)
+        state = st().scheduler.ensure(sym, params, pinned=True)
+        await st().store.save_watch(sym, state.params)
         return next(e for e in st().scheduler.entries() if e.symbol == sym)
 
     @api.delete("/watch/{symbol}", status_code=204)
     async def remove_watch(symbol: str) -> None:
-        if not st().scheduler.remove(_symbol(symbol)):
+        sym = _symbol(symbol)
+        if not st().scheduler.remove(sym):
             raise HTTPException(status_code=404, detail="not watched")
+        await st().store.delete_watch(sym)
 
     @app.websocket("/ws/gex/{symbol}")
     async def ws_gex(websocket: WebSocket, symbol: str) -> None:
