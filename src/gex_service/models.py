@@ -149,6 +149,58 @@ class CharmClock(BaseModel):
     entry_note: str
 
 
+class PathSwitch(BaseModel):
+    """Sign of the expiring book: dampen or amplify. The strike is where that hedge is largest."""
+
+    book: str  # zero_dte | front_week
+    regime: str  # positive_gamma | negative_gamma | flat
+    path: str  # fade | chase | flat
+    expiry: str | None
+    strike: float | None
+    shares_per_1pct: float
+    note: str
+
+
+class WallTape(BaseModel):
+    """Classified customer prints near the open-interest call wall since the tracker started."""
+
+    expiry: str | None
+    call_wall: float | None
+    strikes: list[float] = Field(default_factory=list)
+    customer_call_buy: float = 0.0
+    customer_call_sell: float = 0.0
+    customer_put_buy: float = 0.0
+    customer_put_sell: float = 0.0
+    classified_volume: float = 0.0
+    dealer_gex: float = 0.0  # positive = customers net sold, dealers longer gamma
+    dealer_shares: float = 0.0  # positive = dealers buy the underlying to hedge the new inventory
+    tape: str  # longer_gamma | shorter_gamma | quiet | unavailable
+    wall_read: str  # fade_stands | fade_weaker | unchanged
+    note: str
+
+
+class SessionPath(BaseModel):
+    """Today's path. A live tape with enough size overrides the open-interest sign."""
+
+    source: str  # oi | tape | none
+    path: str  # fade | chase | flat
+    note: str
+
+
+class VolControl(BaseModel):
+    """Trailing-vol echo for index products. Not a measured fund flow and not a strike."""
+
+    applies: bool
+    state: str  # off | selling | full | quiet | unavailable
+    rv_20d: float | None = None  # annualized close-to-close
+    last_return: float | None = None
+    shock_date: str | None = None
+    shock_return: float | None = None
+    sessions_since_shock: int | None = None
+    echo_left: int | None = None
+    note: str
+
+
 class VannaPlay(BaseModel):
     """Dealer hedge if implied vol moves one point, and where that sign flips."""
 
@@ -221,6 +273,10 @@ class GexResponse(BaseModel):
     concentration: Concentration | None = None
     roll_off: list[RollOffScenario] = Field(default_factory=list)
     zero_dte: ZeroDteBook | None = None
+    path_switch: PathSwitch | None = None
+    wall_tape: WallTape | None = None
+    session_path: SessionPath | None = None
+    vol_control: VolControl | None = None
     charm_clock: CharmClock | None = None
     vanna_play: VannaPlay | None = None
     profile: list[StrikeLevel]

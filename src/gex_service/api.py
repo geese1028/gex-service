@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,9 +21,11 @@ from .config import Settings, get_settings
 from .flow import FlowTracker
 from .gex import chain_response
 from .ib_client import IBClient
-from .models import ChainResponse, GexResponse, HealthResponse, HistoryPoint, WatchEntry
+from .vol_control import index_book, vol_control_from_closes
 from .scheduler import Scheduler
 from .store import SnapshotStore
+from .tape import session_path
+from .models import ChainResponse, GexResponse, HealthResponse, HistoryPoint, VolControl, WatchEntry
 
 log = logging.getLogger(__name__)
 
@@ -38,9 +40,11 @@ class AppState:
         self.alerts = AlertManager(self.store, settings.alert_webhook_url)
         self.flow = FlowTracker(self.client, settings.flow_max_symbols, settings.flow_strikes_per_side)
         self.started_at = time.time()
+        self.scheduler.annotate_hooks.append(self._annotate)
         self.scheduler.result_hooks.append(self._alert_hook)
         self.scheduler.result_hooks.append(self._oi_hook)
         self.scheduler.result_hooks.append(self._flow_hook)
+        self.scheduler.session_closed_hooks.append(self._release_tape)
 
     async def start(self) -> None:
         await self.store.open()
@@ -78,6 +82,59 @@ class AppState:
         flow = self.flow.get(result.symbol)
         if flow is not None:
             flow.update_spot(result.spot)
+
+    async def _annotate(self, state, result: GexResponse) -> None:
+        result.vol_control = await self._vol_control(result)
+        result.wall_tape = self.flow.preview(result)
+        result.session_path = session_path(result.path_switch, result.wall_tape)
+        if not getattr(self.client, "session_allowed", lambda: False)():
+            return
+        if not getattr(self.client, "is_connected", False) or not hasattr(self.client, "subscribe"):
+            return
+        snapshot = state.snapshot
+        if snapshot is None:
+            return
+        try:
+            underlying = await self.fetcher.resolve_underlying(result.symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("wall tape resolve %s: %s", result.symbol, exc)
+            return
+        await self.flow.ensure_wall(
+            snapshot,
+            result,
+            lambda row, underlying=underlying: self.fetcher._contract_for(underlying, row),
+            self.settings.risk_free_rate,
+            self.settings.dividend_yield,
+        )
+        result.wall_tape = self.flow.preview(result)
+        result.session_path = session_path(result.path_switch, result.wall_tape)
+
+    async def _vol_control(self, result: GexResponse):
+        day = result.ts.astimezone(NY).date()
+        if not index_book(result.symbol, result.sec_type):
+            return vol_control_from_closes(result.symbol, [], as_of=day, sec_type=result.sec_type)
+        fetch = getattr(self.fetcher, "fetch_bars", None)
+        resolve = getattr(self.fetcher, "resolve_underlying", None)
+        if fetch is None or resolve is None or not getattr(self.client, "is_connected", False):
+            return VolControl(applies=True, state="unavailable", note="Daily bars are not available, so the vol-control echo is not computed.")
+        try:
+            underlying = await resolve(result.symbol)
+            bars = await fetch(underlying, "120 D", "1 day")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("vol-control bars failed for %s: %s", result.symbol, exc)
+            return VolControl(applies=True, state="unavailable", note="Daily bars failed, so the vol-control echo is not computed.")
+        closes = []
+        for bar in bars:
+            ts = bar.date
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            closes.append((ts.astimezone(timezone.utc).date(), float(bar.close)))
+        return vol_control_from_closes(result.symbol, closes, as_of=day, sec_type=result.sec_type)
+
+    async def _release_tape(self) -> None:
+        if self.flow.symbols():
+            log.info("cash session closed; dropping call-wall tape subscriptions")
+            await self.flow.stop_all()
 
 
 def _rss_mb() -> float | None:

@@ -28,6 +28,7 @@ import numpy as np
 
 from .chain import NY, ChainRow, ChainSnapshot
 from .greeks import bs_charm, bs_delta, bs_gamma, bs_vanna, years_from_days
+from .tape import session_path as oi_session_path
 from .models import (
     ChainResponse,
     ChainRowOut,
@@ -42,6 +43,7 @@ from .models import (
     IVContext,
     Meta,
     ParamsOut,
+    PathSwitch,
     RollOffScenario,
     StrikeLevel,
     Summary,
@@ -412,6 +414,67 @@ def front_week_expiry(by_expiry: list[ExpiryStats], day) -> ExpiryStats | None:
     return min(live, key=lambda stats: stats.dte) if live else None
 
 
+def _path_name(regime: str) -> str:
+    if regime == "positive_gamma":
+        return "fade"
+    if regime == "negative_gamma":
+        return "chase"
+    return "flat"
+
+
+def _path_switch(zero_dte: ZeroDteBook, by_expiry: list[ExpiryStats], day) -> PathSwitch:
+    """0DTE when that book exists, otherwise this week's expiry. The strike is the hedge, not a ceiling."""
+    if zero_dte.expiry is not None and (zero_dte.call_wall is not None or abs(zero_dte.total_gex) > 0):
+        path = _path_name(zero_dte.regime)
+        if path == "fade":
+            note = (
+                "Today's expiring gamma is positive. The path is a fade toward the strike where the hedge is largest. "
+                "It dies at the cash close."
+            )
+        elif path == "chase":
+            note = (
+                "Today's expiring gamma is negative. The path is a chase through the strike where the hedge is largest. "
+                "It dies at the cash close."
+            )
+        else:
+            note = "Today's expiring book has no meaningful gamma."
+        return PathSwitch(
+            book="zero_dte",
+            regime=zero_dte.regime,
+            path=path,
+            expiry=zero_dte.expiry,
+            strike=zero_dte.call_wall if zero_dte.call_wall is not None else zero_dte.zero_gamma,
+            shares_per_1pct=zero_dte.shares_per_1pct,
+            note=note,
+        )
+    front = front_week_expiry(by_expiry, day)
+    if front is None:
+        return PathSwitch(
+            book="front_week", regime="flat", path="flat", expiry=None, strike=None, shares_per_1pct=0.0,
+            note="No front-week book.",
+        )
+    regime = _regime(front.total_gex)
+    path = _path_name(regime)
+    if path == "fade":
+        note = (
+            "This week's gamma is positive, so the path is a fade into the call wall. "
+            "The hedge still has to be large versus average daily volume before that fade is forced."
+        )
+    elif path == "chase":
+        note = "This week's gamma is negative. The call wall is where the hedge is largest, and the path is a chase through it."
+    else:
+        note = "This week's book has no meaningful gamma."
+    return PathSwitch(
+        book="front_week",
+        regime=regime,
+        path=path,
+        expiry=front.expiry,
+        strike=front.call_wall,
+        shares_per_1pct=front.shares_per_1pct,
+        note=note,
+    )
+
+
 def _hours_until_close(now: datetime) -> float:
     """Hours from ``now`` until 16:00 ET. Zero once the cash close has passed."""
     local = now.astimezone(NY)
@@ -710,7 +773,9 @@ def compute_gex(snapshot: ChainSnapshot, r: float, q: float, now: datetime | Non
         implied_move=_implied_move(snapshot.rows, spot),
         concentration=_concentration(profile, inp),
         roll_off=roll_off_scenarios(inp, spot, r, q),
-        zero_dte=_zero_dte_book(inp, spot, r, q, hours_left),
+        zero_dte=(zero_book := _zero_dte_book(inp, spot, r, q, hours_left)),
+        path_switch=(path_book := _path_switch(zero_book, by_expiry, as_of.astimezone(NY).date())),
+        session_path=oi_session_path(path_book, None),
         charm_clock=_charm_clock(inp, spot, r, q, hours_left),
         vanna_play=_vanna_play(exposures, spot),
         profile=profile,

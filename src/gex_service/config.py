@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     # Extensions
     eod_archive_time: str = "16:05"  # ET; last snapshot at or before 16:00 ET is archived
     oi_opening_ratio: float = 0.5  # heuristic share of today's volume assumed to open new OI
-    flow_max_symbols: int = 2
+    flow_max_symbols: int = 8
     flow_strikes_per_side: int = 3
     alert_webhook_url: str = ""
     scan_max_symbols: int = 40

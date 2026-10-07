@@ -54,6 +54,10 @@ class Scheduler:
         self._stopping = False
         # Called after every successful refresh (alerts, OI reconciliation, ...).
         self.result_hooks: list[ResultHook] = []
+        # Mutate the result before it is stored (tape, vol-control echo).
+        self.annotate_hooks: list[ResultHook] = []
+        # Drop live IB subscriptions once the cash session is closed.
+        self.session_closed_hooks: list = []
         self._eod_done: set[tuple[str, str]] = set()
 
     # ------------------------------------------------------------- lifecycle
@@ -144,6 +148,11 @@ class Scheduler:
             state.result = result
             state.last_refresh_ts = snapshot.ts
             state.last_error = None
+            for hook in list(self.annotate_hooks):
+                try:
+                    await hook(state, result)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("annotate %s failed for %s: %s", getattr(hook, "__name__", hook), state.symbol, exc)
             try:
                 await self.store.save(result, state.params.key())
                 await self.store.upsert_expiry_days(result)
@@ -251,6 +260,12 @@ class Scheduler:
             cycle_start = time.monotonic()
             self._evict_idle()
             session_open = getattr(self.fetcher.client, "session_allowed", lambda: True)()
+            if not session_open:
+                for hook in list(self.session_closed_hooks):
+                    try:
+                        await hook()
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("session-closed hook failed: %s", exc)
             if session_open and self.fetcher.client.is_connected:
                 for symbol in self.watched():
                     state = self._watch.get(symbol)

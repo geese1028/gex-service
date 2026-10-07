@@ -15,14 +15,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from nautilus_trader.adapters.interactive_brokers.common import IBContract
 from pydantic import BaseModel
 
-from .chain import ChainRow, ChainSnapshot
-from .greeks import bs_gamma, years_from_days
+from .chain import NY, ChainRow, ChainSnapshot
+from .greeks import bs_delta, bs_gamma, years_from_days
 from .ib_client import IBClient, QuoteSnapshot
+from .models import GexResponse, WallTape
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +71,17 @@ class ContractFlow:
             return self.row.gamma
         if self.row.iv:
             return float(bs_gamma(spot, self.row.strike, years_from_days(self.row.dte), self.row.iv, r, q))
+        return 0.0
+
+    def delta(self, spot: float, r: float, q: float) -> float:
+        if self.quote is not None and self.quote.delta is not None:
+            return float(self.quote.delta)
+        if self.row.delta:
+            return self.row.delta
+        if self.row.iv:
+            return float(
+                bs_delta(spot, self.row.strike, years_from_days(self.row.dte), self.row.iv, self.row.right == "C", r, q)
+            )
         return 0.0
 
 
@@ -126,6 +138,8 @@ class SymbolFlow:
         self.client = client
         self.r, self.q = r, q
         self.started_ts = datetime.now(tz=timezone.utc)
+        self.session_day: date = self.started_ts.astimezone(NY).date()
+        self.key: tuple = tuple(sorted((row.expiry, row.strike, row.right, row.con_id) for row, _ in contracts))
         self.flows: dict[int, ContractFlow] = {row.con_id: ContractFlow(row=row, contract=c) for row, c in contracts}
 
     async def start(self) -> None:
@@ -169,6 +183,42 @@ class SymbolFlow:
 
     def update_spot(self, spot: float) -> None:
         self.spot = spot
+
+    def wall_tape(self, result: GexResponse) -> WallTape:
+        from .gex import front_week_expiry
+        from .tape import dealer_gex, dealer_shares, wall_tape_from_legs
+
+        day = result.ts.astimezone(NY).date()
+        front = front_week_expiry(result.by_expiry, day)
+        expiry = front.expiry if front is not None else None
+        call_wall = front.call_wall if front is not None else result.summary.call_wall
+        call_buy = call_sell = put_buy = put_sell = 0.0
+        gex_sum = share_sum = 0.0
+        strikes: set[float] = set()
+        for cf in self.flows.values():
+            if expiry is not None and cf.row.expiry != expiry:
+                continue
+            strikes.add(cf.row.strike)
+            if cf.row.right == "C":
+                call_buy += cf.buy_volume
+                call_sell += cf.sell_volume
+            else:
+                put_buy += cf.buy_volume
+                put_sell += cf.sell_volume
+            net = cf.buy_volume - cf.sell_volume
+            gex_sum += dealer_gex(net, cf.gamma(self.spot, self.r, self.q), cf.row.multiplier, self.spot)
+            share_sum += dealer_shares(net, cf.delta(self.spot, self.r, self.q), cf.row.multiplier)
+        return wall_tape_from_legs(
+            expiry=expiry,
+            call_wall=call_wall,
+            strikes=sorted(strikes),
+            call_buy=call_buy,
+            call_sell=call_sell,
+            put_buy=put_buy,
+            put_sell=put_sell,
+            gex=gex_sum,
+            shares=share_sum,
+        )
 
     def response(self) -> FlowResponse:
         out: list[ContractFlowOut] = []
@@ -248,3 +298,58 @@ class FlowTracker:
     async def stop_all(self) -> None:
         for symbol in list(self._flows):
             await self.stop(symbol)
+
+    def preview(self, result: GexResponse) -> WallTape:
+        from .gex import front_week_expiry
+        from .tape import unavailable_tape
+
+        flow = self.get(result.symbol)
+        if flow is not None:
+            return flow.wall_tape(result)
+        day = result.ts.astimezone(NY).date()
+        front = front_week_expiry(result.by_expiry, day)
+        expiry = front.expiry if front is not None else None
+        call_wall = front.call_wall if front is not None else result.summary.call_wall
+        return unavailable_tape(expiry, call_wall)
+
+    async def ensure_wall(self, snapshot: ChainSnapshot, result: GexResponse, contract_for, r: float, q: float) -> SymbolFlow | None:
+        """Subscribe the front-week call wall. Retarget when the strike set changes; reset on a new session."""
+        from .gex import front_week_expiry
+        from .tape import select_wall_rows
+
+        symbol = snapshot.symbol.upper()
+        today = snapshot.ts.astimezone(NY).date()
+        existing = self._flows.get(symbol)
+        if existing is not None and existing.session_day != today:
+            await self.stop(symbol)
+            existing = None
+        front = front_week_expiry(result.by_expiry, today)
+        expiry = front.expiry if front is not None else None
+        wall = front.call_wall if front is not None else result.summary.call_wall
+        rows = select_wall_rows(snapshot, expiry, wall, neighbors=1)
+        if not rows:
+            return existing
+        key = tuple(sorted((row.expiry, row.strike, row.right, row.con_id) for row in rows))
+        if existing is not None and existing.key == key:
+            existing.update_spot(snapshot.spot)
+            return existing
+        if existing is not None:
+            await self.stop(symbol)
+        if self.max_symbols <= 0 or len(self._flows) >= self.max_symbols:
+            log.info("wall tape skipped for %s: flow cap is %s", symbol, self.max_symbols)
+            return None
+        if not hasattr(self.client, "subscribe"):
+            return None
+        try:
+            self.client.require_connected()
+        except Exception:  # noqa: BLE001
+            return None
+        if self.client.lines_in_use + len(rows) > self.client.settings.max_md_lines:
+            log.info("wall tape skipped for %s: market-data lines are full", symbol)
+            return None
+        contracts = [(row, contract_for(row)) for row in rows]
+        flow = SymbolFlow(symbol, snapshot.spot, self.client, contracts, r, q)
+        flow.session_day = today
+        await flow.start()
+        self._flows[symbol] = flow
+        return flow
