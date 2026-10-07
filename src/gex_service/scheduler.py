@@ -250,7 +250,8 @@ class Scheduler:
         while not self._stopping:
             cycle_start = time.monotonic()
             self._evict_idle()
-            if self.fetcher.client.is_connected:
+            session_open = getattr(self.fetcher.client, "session_allowed", lambda: True)()
+            if session_open and self.fetcher.client.is_connected:
                 for symbol in self.watched():
                     state = self._watch.get(symbol)
                     if state is None or state.refreshing.locked():

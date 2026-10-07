@@ -19,6 +19,9 @@ class FakeClient:
     market_data_type = 1
     lines_in_use = 0
 
+    def session_allowed(self) -> bool:
+        return True
+
     async def start(self):
         pass
 

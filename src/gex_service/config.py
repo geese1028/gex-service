@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     ib_host: str = "127.0.0.1"
     ib_port: int = 4002
     ib_client_id: int = 1
+    # Release the Gateway client outside US cash hours so other systems can use it.
+    ib_rth_only: bool = True
     ib_connect_timeout_s: float = 60.0
     ib_reconnect_min_s: float = 5.0
     ib_reconnect_max_s: float = 300.0

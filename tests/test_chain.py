@@ -12,7 +12,7 @@ from gex_service.chain import (
     ticker_to_row,
 )
 from gex_service.config import Settings
-from gex_service.ib_client import is_rth_now
+from gex_service.ib_client import IBClient, is_rth_now
 
 NOW = datetime(2026, 10, 5, 10, 30, tzinfo=NY)  # Monday during RTH
 
@@ -84,6 +84,15 @@ def test_is_rth_now():
     assert is_rth_now(NOW)
     assert not is_rth_now(datetime(2026, 10, 5, 8, 0, tzinfo=NY))
     assert not is_rth_now(datetime(2026, 10, 4, 12, 0, tzinfo=NY))  # Sunday
+
+
+def test_ib_client_stays_disconnected_outside_rth():
+    client = IBClient(Settings(_env_file=None, ib_rth_only=True))
+    assert client.session_allowed(NOW)
+    assert not client.session_allowed(datetime(2026, 10, 5, 16, 5, tzinfo=NY))
+    assert not client.session_allowed(datetime(2026, 10, 4, 12, 0, tzinfo=NY))
+    always = IBClient(Settings(_env_file=None, ib_rth_only=False))
+    assert always.session_allowed(datetime(2026, 10, 5, 20, 0, tzinfo=NY))
 
 
 def test_fill_iv_from_counterpart():

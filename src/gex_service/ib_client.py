@@ -288,6 +288,7 @@ class IBClient:
         self._last_error: str | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._stopping = False
+        self._session_task: asyncio.Task | None = None
         self._market_data_type: int | None = None
         self._lines: dict[int, InstrumentId] = {}
         self._req_by_con: dict[int, int] = {}
@@ -334,8 +335,20 @@ class IBClient:
         return self._historic._data_client.instrument_provider
 
     # ------------------------------------------------------------- lifecycle
+    def session_allowed(self, now: datetime | None = None) -> bool:
+        """False outside US cash RTH when ``ib_rth_only`` is set. The client id stays free."""
+        if not self.settings.ib_rth_only:
+            return True
+        return is_rth_now(now)
+
     async def start(self) -> None:
         self._stopping = False
+        if self._session_task is None or self._session_task.done():
+            self._session_task = asyncio.create_task(self._session_loop(), name="gex-ib-session")
+        if not self.session_allowed():
+            self._last_error = "IBKR released outside US regular trading hours (09:30-16:00 ET)"
+            log.info("outside US RTH; not connecting, clientId=%s stays free", self.settings.ib_client_id)
+            return
         try:
             await self.connect()
         except Exception as exc:  # noqa: BLE001
@@ -344,12 +357,39 @@ class IBClient:
 
     async def stop(self) -> None:
         self._stopping = True
+        if self._session_task:
+            self._session_task.cancel()
+            self._session_task = None
         if self._reconnect_task:
             self._reconnect_task.cancel()
             self._reconnect_task = None
         await self._disconnect()
 
+    async def _session_loop(self) -> None:
+        """Connect at the cash open and drop the Gateway client at the close."""
+        while not self._stopping:
+            try:
+                if self.session_allowed():
+                    if not self.is_connected:
+                        await self.connect()
+                        log.info("US cash session open; IBKR client %s connected", self.settings.ib_client_id)
+                elif self.is_connected or self._historic is not None:
+                    if self.lines_in_use == 0:
+                        log.info("US cash session ended; releasing IBKR client %s", self.settings.ib_client_id)
+                        if self._reconnect_task:
+                            self._reconnect_task.cancel()
+                            self._reconnect_task = None
+                        await self._disconnect()
+                        self._last_error = "IBKR released outside US regular trading hours (09:30-16:00 ET)"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("IB session loop: %s", exc)
+            await asyncio.sleep(30)
+
     async def connect(self) -> None:
+        if not self.session_allowed():
+            raise ConnectionError(self._last_error or "outside US regular trading hours")
         async with self._connect_lock:
             if self.is_connected:
                 return
@@ -435,6 +475,8 @@ class IBClient:
             log.debug("Nautilus disconnect: %s", exc)
 
     def _schedule_reconnect(self) -> None:
+        if self._stopping or not self.session_allowed():
+            return
         if self._reconnect_task and not self._reconnect_task.done():
             return
         self._reconnect_task = asyncio.create_task(self._reconnect_loop())
@@ -442,7 +484,11 @@ class IBClient:
     async def _reconnect_loop(self) -> None:
         delay = self.settings.ib_reconnect_min_s
         while not self._stopping and not self.is_connected:
+            if not self.session_allowed():
+                return
             await asyncio.sleep(delay)
+            if not self.session_allowed():
+                return
             try:
                 await self.connect()
                 log.info("reconnected to IB Gateway via Nautilus")
